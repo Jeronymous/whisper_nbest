@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import tqdm
+from torch import Tensor
 
 from .audio import (
     FRAMES_PER_SECOND,
@@ -234,15 +235,57 @@ def transcribe(
         initial_prompt_tokens = []
 
     def new_segment(
-        *, start: float, end: float, tokens: torch.Tensor, result: DecodingResult
+        *, start: float, end: float, result: DecodingResult,
+        tokens: Tensor,
+        tokens_slice: Optional[Tuple[int,int]] = None,
+        decode_nbest_tokens_with = None,
     ):
+        if tokens_slice:
+            start, end = tokens_slice
+            tokens = tokens[start:end]
+        else:
+            start = 0
+            end = len(tokens)
+
+        has_nbest = (len(tokens.shape) == 2)
+        if has_nbest:
+            tokens = tokens.transpose(0, 1).tolist()
+            tokens = [[ti for ti in t if ti != tokenizer.no_timestamps] for t in tokens] # NOCOMMIT do we need?
+            nbest_logprobs = [logprobs[start:end] for logprobs in result.nbest_logprobs]
+            text_tokens = [[ti for ti in t if ti < tokenizer.eot] for t in tokens]
+            texts = [tokenizer.decode(t).strip() for t in text_tokens]
+            nbest_tokens = tokens
+            assert len(nbest_tokens) == len(nbest_logprobs) == len(texts)
+            # Remove duplicates
+            for i in range(len(nbest_tokens)-1, -1, -1):
+                if nbest_tokens[i] in nbest_tokens[:i]:
+                    del nbest_tokens[i]
+                    del nbest_logprobs[i]
+                    del texts[i]
+            if decode_nbest_tokens_with:
+                nbest_tokens = [[decode_nbest_tokens_with.decode_with_timestamps([ti]) for ti in t] for t in nbest_tokens]
+            return {
+                "start": start,
+                "end": end,
+                "text": texts[0],
+                "nbest_texts": texts,
+                "nbest_logprobs": nbest_logprobs,
+                "nbest_tokens": nbest_tokens,
+                "tokens": tokens[0],
+                "avg_logprob": result.avg_logprob,
+                "temperature": result.temperature,
+                "compression_ratio": result.compression_ratio,
+                "no_speech_prob": result.no_speech_prob,
+                "seek": seek,
+            }
+
         tokens = tokens.tolist()
         text_tokens = [token for token in tokens if token < tokenizer.eot]
         return {
             "seek": seek,
             "start": start,
             "end": end,
-            "text": tokenizer.decode(text_tokens),
+            "text": tokenizer.decode(text_tokens).strip(),
             "tokens": tokens,
             "temperature": result.temperature,
             "avg_logprob": result.avg_logprob,
@@ -277,7 +320,21 @@ def transcribe(
 
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
             result: DecodingResult = decode_with_fallback(mel_segment)
-            tokens = torch.tensor(result.tokens)
+            if isinstance(result.nbest_logprobs, list):
+                # We kept the k-best hypotheses
+                # but they might not have timestamps at the same moment,
+                # so we first need to align them first, so that the same logic can apply to all of them
+                nbest_tokens = sync_timestamps_with_padding(
+                    result.tokens,
+                    tokenizer.no_timestamps,
+                    tokenizer.timestamp_begin
+                )
+                nbest_tokens = torch.tensor(nbest_tokens)
+                tokens = nbest_tokens[0]
+                nbest_tokens = nbest_tokens.transpose(0, 1)
+            else:
+                tokens = torch.tensor(result.tokens)
+                nbest_tokens = tokens
 
             if no_speech_threshold is not None:
                 # no voice activity check
@@ -344,8 +401,10 @@ def transcribe(
                         new_segment(
                             start=time_offset + start_timestamp_pos * time_precision,
                             end=time_offset + end_timestamp_pos * time_precision,
-                            tokens=sliced_tokens,
                             result=result,
+                            tokens = nbest_tokens,
+                            tokens_slice=(last_slice, current_slice),
+                            decode_nbest_tokens_with=tokenizer,
                         )
                     )
                     last_slice = current_slice
@@ -376,8 +435,9 @@ def transcribe(
                     new_segment(
                         start=time_offset,
                         end=time_offset + duration,
-                        tokens=tokens,
                         result=result,
+                        tokens = nbest_tokens,
+                        decode_nbest_tokens_with=tokenizer,
                     )
                 )
                 seek += segment_size
@@ -467,7 +527,11 @@ def transcribe(
 
             # if a segment is instantaneous or does not contain text, clear it
             for i, segment in enumerate(current_segments):
-                if segment["start"] == segment["end"] or segment["text"].strip() == "":
+                if isinstance(segment["text"], str):
+                    empty_text = (segment["text"].strip() == "")
+                else:
+                    empty_text = all(s.strip() == "" for s in segment["text"])
+                if segment["start"] == segment["end"] or empty_text:
                     segment["text"] = ""
                     segment["tokens"] = []
                     segment["words"] = []
@@ -496,6 +560,33 @@ def transcribe(
         segments=all_segments,
         language=language,
     )
+
+
+def sync_timestamps_with_padding(list_of_tokens, padding_token, min_timestamp):
+    _out = 1_000_000_000
+    assert padding_token < min_timestamp
+    n = len(list_of_tokens)
+    new_list_of_tokens = [[] for _ in list_of_tokens]
+    offsets = [0] * n
+    lens = [len(t) for t in list_of_tokens]
+    t = 0
+    while any(offset+t < len for offset, len in zip(offsets, lens)):
+        current_tokens = [tokens[t+offset] if t+offset < len(tokens) else _out for offset, tokens in zip(offsets, list_of_tokens)]
+        has_timestamp = any(token >= min_timestamp for token in current_tokens)
+        all_timestamps = has_timestamp and all(token >= min_timestamp for token in current_tokens)
+        if all_timestamps or not has_timestamp:
+            for i, token in enumerate(current_tokens):
+                new_list_of_tokens[i].append(token if token != _out else padding_token)
+        else:
+            # Need to add some padding for some lists of tokens
+            for i, token in enumerate(current_tokens):
+                if token >= min_timestamp:
+                    new_list_of_tokens[i].append(padding_token)
+                    offsets[i] -= 1
+                else:
+                    new_list_of_tokens[i].append(token if token != _out else padding_token)
+        t += 1
+    return new_list_of_tokens
 
 
 def cli():
