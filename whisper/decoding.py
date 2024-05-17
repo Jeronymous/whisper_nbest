@@ -314,7 +314,9 @@ class BeamSearchDecoder(TokenDecoder):
         eot: int,
         inference: Inference,
         patience: Optional[float] = None,
+        use_nbest_heuristics: bool = False,
         timestamp_begin: Optional[int] = None,
+        punctuation_tokens: Optional[set[int]] = None,
     ):
         self.beam_size = beam_size
         self.eot = eot
@@ -322,11 +324,17 @@ class BeamSearchDecoder(TokenDecoder):
         self.patience = patience or 1.0
         self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences = None
-        self.timestamp_begin = timestamp_begin
 
         assert (
             self.max_candidates > 0
         ), f"Invalid beam size ({beam_size}) or patience ({patience})"
+
+        self.use_nbest_heuristics = use_nbest_heuristics
+        self.timestamp_begin = timestamp_begin
+        self.punctuation_tokens = punctuation_tokens
+        if self.use_nbest_heuristics:
+            assert self.timestamp_begin is not None, "use_nbest_heuristics requires timestamp_begin"
+            assert self.punctuation_tokens is not None, "use_nbest_heuristics requires punctuation_tokens"
 
     def reset(self):
         self.finished_sequences = None
@@ -355,19 +363,30 @@ class BeamSearchDecoder(TokenDecoder):
                 idx = i * self.beam_size + j
                 prefix = tokens[idx].tolist()
 
-                if enforce_unique_timestamps and self.timestamp_begin:
-                    # We constraint to have one timestamp possible for each beam
-                    # otherwise the set of hypotheses may include too many 
-                    # timestamps variants we don't really care about
+                if enforce_unique_timestamps and self.use_nbest_heuristics:
+                    # 1. We constraint to have one timestamp possible for each beam
+                    #    otherwise the set of hypotheses may include too many 
+                    #    timestamps variants we don't really care about
+                    # 2. We contraint to have one alternative of punctuation max for each beam
+                    #    (same reasons)
                     has_timestamps = False
+                    has_punctuation = False
                     num_selected = 0
-                    for logprob, token in zip(*logprobs[idx].sort(descending=True)):
-                        if has_timestamps and token >= self.timestamp_begin:
+                    sorted_logprbs, sorted_tokens = logprobs[idx].sort(descending=True)
+                    sorted_tokens = sorted_tokens.tolist()
+                    for logprob, token in zip(sorted_logprbs, sorted_tokens):
+                        is_timestamp = token >= self.timestamp_begin
+                        is_punctuation = not is_timestamp and token in self.punctuation_tokens
+                        if has_timestamps and is_timestamp:
                             continue
-                        elif self.timestamp_begin and token >= self.timestamp_begin:
+                        elif self.timestamp_begin and is_timestamp:
                             has_timestamps = True
+                        elif has_punctuation and is_punctuation:
+                            continue
+                        elif is_punctuation:
+                            has_punctuation = True
                         new_logprob = (sum_logprobs[idx] + logprob).item()
-                        sequence = tuple(prefix + [token.item()])
+                        sequence = tuple(prefix + [token])
                         scores[sequence] = new_logprob
                         sources[sequence] = idx
                         if nbest_logprobs:
@@ -589,7 +608,9 @@ class DecodingTask:
         if options.beam_size not in [None, 1]:
             self.decoder = BeamSearchDecoder(
                 options.beam_size, tokenizer.eot, self.inference, options.patience,
-                tokenizer.timestamp_begin if options.return_nbest else None
+                use_nbest_heuristics=options.return_nbest,
+                timestamp_begin=tokenizer.timestamp_begin if options.return_nbest else None,
+                punctuation_tokens=get_punctuation_tokens(tokenizer) if options.return_nbest else None,
             )
         else:
             self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
@@ -884,6 +905,23 @@ class DecodingTask:
                 *fields
             )
         ]
+
+
+_punctuation_tokens = None
+def get_punctuation_tokens(tokenizer):
+    global _punctuation_tokens
+    if _punctuation_tokens is not None:
+        return _punctuation_tokens
+    _punctuation_tokens = set()
+    import regex as re
+    tokens = [tokenizer.decode([i]) for i in range(tokenizer.eot)]
+    for itok, tok in enumerate(tokens):
+        if tok in tokenizer.non_speech_tokens:
+            continue
+        if re.match(r" *\p{P}\p{P}*$", tok):
+            # print(f"Punctuation token: '{tok}'")
+            _punctuation_tokens.add(itok)
+    return _punctuation_tokens
 
 
 @torch.no_grad()
