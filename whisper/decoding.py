@@ -385,8 +385,8 @@ class BeamSearchDecoder(TokenDecoder):
                     #    timestamps variants we don't really care about
                     # 2. We contraint to have one alternative of punctuation max for each beam
                     #    (same reasons)
-                    has_timestamps = False
-                    has_punctuation = False
+                    has_timestamps = None
+                    has_punctuation = None
                     num_selected = 0
                     sorted_logprbs, sorted_tokens = logprobs[idx].sort(descending=True)
                     sorted_tokens = sorted_tokens.tolist()
@@ -394,13 +394,31 @@ class BeamSearchDecoder(TokenDecoder):
                         is_timestamp = token >= self.timestamp_begin
                         is_punctuation = not is_timestamp and token in self.punctuation_tokens
                         if has_timestamps and is_timestamp:
+                            # Not several alternatives of timestamps (take only the best one)
                             continue
                         elif self.timestamp_begin and is_timestamp:
+                            if has_timestamps is False:
+                                # Do not opt in for a timestamp if the best hypothesis is not a timestamp
+                                continue
                             has_timestamps = True
                         elif has_punctuation and is_punctuation:
+                            # Not several alternatives of punctuation (take only the best one)
                             continue
                         elif is_punctuation:
-                            has_punctuation = True
+                            if has_punctuation is None:
+                                has_punctuation = is_punctuation
+                            else:
+                                # Do not opt in for punctuation if the best hypothesis is not a punctuation
+                                continue
+                        else: # not a timestamp nor punctuation
+                            if has_punctuation is None:
+                                has_punctuation = False
+                            elif has_punctuation:
+                                # Do not opt out of punctuation if the best hypothesis is a punctuation
+                                continue
+                            elif has_timestamps:
+                                # Do not opt out of timestamps if the best hypothesis is a timestamp
+                                continue
                         if not logprob.isfinite().item():
                             # That happens for instance at the first step, when predicting the first timestamp (and only timestamps are allowed)
                             # All tokens except timestamps have null probability (log(0) = -inf), and we should ignore them
@@ -970,7 +988,7 @@ def get_punctuation_tokens(tokenizer):
     for itok, tok in enumerate(tokens):
         if tok in tokenizer.non_speech_tokens:
             continue
-        if re.match(r" *\p{P}\p{P}*$", tok):
+        if re.match(r" *\p{P}\p{P}*$", tok) or not tok.strip():
             # print(f"Punctuation token: '{tok}'")
             _punctuation_tokens.add(itok)
 
