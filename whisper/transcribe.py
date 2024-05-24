@@ -239,6 +239,7 @@ def transcribe(
         tokens: Tensor,
         tokens_slice: Optional[Tuple[int,int]] = None,
         decode_nbest_tokens_with = None,
+        nbest_logprobs = None,
     ):
         if tokens_slice:
             start, end = tokens_slice
@@ -251,7 +252,9 @@ def transcribe(
         if has_nbest:
             tokens = tokens.transpose(0, 1).tolist()
             tokens = [[ti for ti in t if ti != tokenizer.no_timestamps] for t in tokens] # NOCOMMIT do we need?
-            nbest_logprobs = [logprobs[start:end] for logprobs in result.nbest_logprobs]
+            if nbest_logprobs is None:
+                nbest_logprobs = result.nbest_logprobs
+            nbest_logprobs = [[l for l in logprobs[start:end] if l is not None] for logprobs in nbest_logprobs]
             text_tokens = [[ti for ti in t if ti < tokenizer.eot] for t in tokens]
             texts = [tokenizer.decode(t).strip() for t in text_tokens]
             nbest_tokens = tokens
@@ -265,18 +268,18 @@ def transcribe(
             if decode_nbest_tokens_with:
                 nbest_tokens = [[decode_nbest_tokens_with.decode_with_timestamps([ti]) for ti in t] for t in nbest_tokens]
             return {
+                "seek": seek,
                 "start": start,
                 "end": end,
                 "text": texts[0],
-                "nbest_texts": texts,
-                "nbest_logprobs": nbest_logprobs,
-                "nbest_tokens": nbest_tokens,
                 "tokens": tokens[0],
-                "avg_logprob": result.avg_logprob,
                 "temperature": result.temperature,
+                "avg_logprob": result.avg_logprob,
                 "compression_ratio": result.compression_ratio,
                 "no_speech_prob": result.no_speech_prob,
-                "seek": seek,
+                "nbest_texts": texts,
+                "nbest_tokens": nbest_tokens,
+                "nbest_logprobs": nbest_logprobs,
             }
 
         tokens = tokens.tolist()
@@ -320,14 +323,15 @@ def transcribe(
 
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
             result: DecodingResult = decode_with_fallback(mel_segment)
-            if isinstance(result.nbest_logprobs, list):
+            if result.nbest_logprobs is not None:
                 # We kept the k-best hypotheses
                 # but they might not have timestamps at the same moment,
                 # so we first need to align them first, so that the same logic can apply to all of them
-                nbest_tokens = sync_timestamps_with_padding(
+                nbest_tokens, nbest_logprobs = align_segments_around_timestamps(
                     result.tokens,
-                    tokenizer.no_timestamps,
-                    tokenizer.timestamp_begin
+                    padding_token=tokenizer.no_timestamps,
+                    min_timestamp=tokenizer.timestamp_begin,
+                    also_sync=result.nbest_logprobs,
                 )
                 nbest_tokens = torch.tensor(nbest_tokens)
                 tokens = nbest_tokens[0]
@@ -335,6 +339,7 @@ def transcribe(
             else:
                 tokens = torch.tensor(result.tokens)
                 nbest_tokens = tokens
+                nbest_logprobs = None
 
             if no_speech_threshold is not None:
                 # no voice activity check
@@ -405,6 +410,7 @@ def transcribe(
                             tokens = nbest_tokens,
                             tokens_slice=(last_slice, current_slice),
                             decode_nbest_tokens_with=tokenizer,
+                            nbest_logprobs=nbest_logprobs,
                         )
                     )
                     last_slice = current_slice
@@ -438,6 +444,7 @@ def transcribe(
                         result=result,
                         tokens = nbest_tokens,
                         decode_nbest_tokens_with=tokenizer,
+                        nbest_logprobs=nbest_logprobs,
                     )
                 )
                 seek += segment_size
@@ -562,11 +569,15 @@ def transcribe(
     )
 
 
-def sync_timestamps_with_padding(list_of_tokens, padding_token, min_timestamp):
+def align_segments_around_timestamps(list_of_tokens, padding_token, min_timestamp, also_sync=None):
     _out = 1_000_000_000
+    _no_proba = None
     assert padding_token < min_timestamp
     n = len(list_of_tokens)
     new_list_of_tokens = [[] for _ in list_of_tokens]
+    if also_sync:
+        assert len(also_sync) == len(list_of_tokens), f"{len(also_sync)} != {len(list_of_tokens)}"
+        new_other = [[] for _ in list_of_tokens]
     offsets = [0] * n
     lens = [len(t) for t in list_of_tokens]
     t = 0
@@ -574,18 +585,28 @@ def sync_timestamps_with_padding(list_of_tokens, padding_token, min_timestamp):
         current_tokens = [tokens[t+offset] if t+offset < len(tokens) else _out for offset, tokens in zip(offsets, list_of_tokens)]
         has_timestamp = any(token >= min_timestamp for token in current_tokens)
         all_timestamps = has_timestamp and all(token >= min_timestamp for token in current_tokens)
+        if also_sync:
+            current_others = [o[t+offset] if t+offset < len(o) else _out for offset, o in zip(offsets, also_sync)]
         if all_timestamps or not has_timestamp:
             for i, token in enumerate(current_tokens):
                 new_list_of_tokens[i].append(token if token != _out else padding_token)
+                if also_sync:
+                    new_other[i].append(current_others[i] if token != _out else _no_proba)
         else:
             # Need to add some padding for some lists of tokens
             for i, token in enumerate(current_tokens):
                 if token >= min_timestamp:
                     new_list_of_tokens[i].append(padding_token)
+                    if also_sync:
+                        new_other[i].append(_no_proba)
                     offsets[i] -= 1
                 else:
                     new_list_of_tokens[i].append(token if token != _out else padding_token)
+                    if also_sync:
+                        new_other[i].append(current_others[i] if token != _out else _no_proba)
         t += 1
+    if also_sync:
+        return new_list_of_tokens, new_other
     return new_list_of_tokens
 
 
