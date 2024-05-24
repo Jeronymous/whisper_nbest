@@ -401,6 +401,10 @@ class BeamSearchDecoder(TokenDecoder):
                             continue
                         elif is_punctuation:
                             has_punctuation = True
+                        if not logprob.isfinite().item():
+                            # That happens for instance at the first step, when predicting the first timestamp (and only timestamps are allowed)
+                            # All tokens except timestamps have null probability (log(0) = -inf), and we should ignore them
+                            break
                         new_logprob = (sum_logprobs[idx] + logprob).item()
                         sequence = tuple(prefix + [token])
                         scores[sequence] = new_logprob
@@ -438,6 +442,16 @@ class BeamSearchDecoder(TokenDecoder):
                     saved += 1
                     if saved == self.beam_size:
                         break
+
+            if saved < self.beam_size:
+                # This can happen at the first step, when taking the first timestamp only
+                # we stopped earlier than expected above
+                assert len(next_tokens)
+                while len(next_tokens) < self.beam_size:
+                    next_tokens.append(next_tokens[i % self.beam_size])
+                    source_indices.append(source_indices[i % self.beam_size])
+                    if compute_nbest_logprobs:
+                        new_nbest_logprobs.append(new_nbest_logprobs[i % self.beam_size])
 
             finished_sequences.append(finished)
             finished_sequences_logprobs.append(finished_logprobs)
@@ -807,7 +821,7 @@ class DecodingTask:
                     logits,
                     sum_logprobs,
                     nbest_logprobs,
-                    enforce_unique_timestamps=i>0,
+                    enforce_unique_timestamps=nbest_logprobs is not None,
                 )
 
                 if completed or tokens.shape[-1] > self.n_ctx:
