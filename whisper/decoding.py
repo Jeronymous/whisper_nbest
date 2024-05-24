@@ -871,14 +871,15 @@ class DecodingTask:
                 [lpi / (len(ti) + 1) for ti, lpi in zip(t, lp)] for t, lp in zip(tokens, sum_logprobs)
             ]
 
-            # Make sure best hypothesis comes first, for each audio
+            # Make sure hypotheses are sorted, for each audio
             for i, (avg_logprob, token_logprob, token, text) in enumerate(zip(avg_logprobs, nbest_logprobs, tokens, texts)):
-                if avg_logprob[0] < max(avg_logprob) - 1.e-6:
-                    avg_logprob, token_logprob, token, text = zip(*sorted(zip(avg_logprob, token_logprob, token, text), reverse=True))
-                    avg_logprobs[i] = avg_logprob
-                    nbest_logprobs[i] = token_logprob
-                    tokens[i] = token
-                    texts[i] = text
+                # if avg_logprob[0] >= max(avg_logprob) - 1.e-6:
+                #    continue
+                avg_logprob, token_logprob, token, text = zip(*sorted(zip(avg_logprob, token_logprob, token, text), reverse=True))
+                avg_logprobs[i] = avg_logprob
+                nbest_logprobs[i] = token_logprob
+                tokens[i] = token
+                texts[i] = text
 
             return [
                 DecodingResult(
