@@ -375,9 +375,15 @@ class BeamSearchDecoder(TokenDecoder):
             individual_logprobs, finished_logprobs = {}, {}
 
             # STEP 1: calculate the cumulative log probabilities for possible candidates
+            prefixes = set()
             for j in range(self.beam_size):
                 idx = i * self.beam_size + j
                 prefix = tokens[idx].tolist()
+                prefix_tuple = tuple(prefix)
+                if prefix_tuple in prefixes:
+                    # There can be several times the same hypothesis
+                    continue
+                prefixes.add(prefix_tuple)
 
                 if enforce_unique_timestamps and self.use_nbest_heuristics:
                     # 1. We constraint to have one timestamp possible for each beam
@@ -388,9 +394,9 @@ class BeamSearchDecoder(TokenDecoder):
                     has_timestamps = None
                     has_punctuation = None
                     num_selected = 0
-                    sorted_logprbs, sorted_tokens = logprobs[idx].sort(descending=True)
+                    sorted_logprobs, sorted_tokens = logprobs[idx].sort(descending=True)
                     sorted_tokens = sorted_tokens.tolist()
-                    for logprob, token in zip(sorted_logprbs, sorted_tokens):
+                    for logprob, token in zip(sorted_logprobs, sorted_tokens):
                         is_timestamp = token >= self.timestamp_begin
                         is_punctuation = not is_timestamp and token in self.punctuation_tokens
                         if has_timestamps and is_timestamp:
