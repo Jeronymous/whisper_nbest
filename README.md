@@ -1,3 +1,5 @@
+# This is a fork of https://github.com/openai/whisper with some modifications to provide several hypothesis for each audio file.
+
 # Whisper
 
 [[Blog]](https://openai.com/blog/whisper)
