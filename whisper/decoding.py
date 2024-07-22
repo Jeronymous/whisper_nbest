@@ -402,7 +402,7 @@ class BeamSearchDecoder(TokenDecoder):
                         if has_timestamps and is_timestamp:
                             # Not several alternatives of timestamps (take only the best one)
                             continue
-                        elif self.timestamp_begin and is_timestamp:
+                        elif is_timestamp:
                             if has_timestamps is False:
                                 # Do not opt in for a timestamp if the best hypothesis is not a timestamp
                                 continue
@@ -425,6 +425,8 @@ class BeamSearchDecoder(TokenDecoder):
                             elif has_timestamps:
                                 # Do not opt out of timestamps if the best hypothesis is a timestamp
                                 continue
+                        if has_timestamps is None:
+                            has_timestamps = is_timestamp
                         if not logprob.isfinite().item():
                             # That happens for instance at the first step, when predicting the first timestamp (and only timestamps are allowed)
                             # All tokens except timestamps have null probability (log(0) = -inf), and we should ignore them
